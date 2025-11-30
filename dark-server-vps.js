@@ -65,6 +65,7 @@ class Queue {
 
 class Connections {
   #conns = new Map(); // account -> { ws, queues, heartbeat }
+  #isActive = (ws) => !!ws && ws.readyState === WebSocket.OPEN;
 
   add(ws, info) {
     const account = normalizeAccount(info.account) || "default";
@@ -131,10 +132,10 @@ class Connections {
     if (!account) return this.hasAnyConn();
     return !!this.getConn(account);
   };
-  hasAnyConn = () => Array.from(this.#conns.values()).some((entry) => entry.ws?.isAlive);
+  hasAnyConn = () => Array.from(this.#conns.values()).some((entry) => this.#isActive(entry.ws));
 
   onlyConn() {
-    const alive = Array.from(this.#conns.entries()).filter(([, entry]) => entry.ws?.isAlive);
+    const alive = Array.from(this.#conns.entries()).filter(([, entry]) => this.#isActive(entry.ws));
     if (alive.length === 1) return alive[0][0];
     return null;
   }
@@ -142,7 +143,7 @@ class Connections {
   retag(oldAccount, newAccount) {
     if (!oldAccount || !newAccount || oldAccount === newAccount) return false;
     const entry = this.#conns.get(oldAccount);
-    if (!entry?.ws?.isAlive || this.#conns.has(newAccount)) return false;
+    if (!this.#isActive(entry?.ws) || this.#conns.has(newAccount)) return false;
     this.#conns.delete(oldAccount);
     this.#conns.set(newAccount, entry);
     log("warn", `连接账号重命名: ${oldAccount} -> ${newAccount}`);
@@ -151,15 +152,15 @@ class Connections {
 
   getConn(account) {
     const entry = this.#conns.get(account);
-    if (entry?.ws?.isAlive) return entry.ws;
-    if (entry) this.#teardown(account, entry);
+    if (this.#isActive(entry?.ws)) return entry.ws;
+    if (entry && entry.ws?.readyState === WebSocket.CLOSED) this.#teardown(account, entry);
     this.#conns.delete(account);
     return null;
   }
 
   firstAccount() {
     for (const [account, entry] of this.#conns.entries()) {
-      if (entry.ws?.isAlive) return account;
+      if (this.#isActive(entry.ws)) return account;
     }
     return null;
   }
