@@ -1,12 +1,41 @@
 const express = require("express");
 const WebSocket = require("ws");
 const http = require("http");
+const crypto = require("crypto");
 
 const SECRET_KEY = process.env.MY_SECRET_KEY || "123456";
 const DEFAULT_STREAMING_MODE = "real";
 
 const log = (level, msg) => console[level](`[${level.toUpperCase()}] ${new Date().toISOString()} - ${msg}`);
 const genId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+
+class KeyManager {
+  #charSet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-";
+  #accountToKey = new Map();
+  #keyToAccount = new Map();
+
+  getOrCreate(account) {
+    if (!account) throw new Error("账号无效");
+    if (!this.#accountToKey.has(account)) {
+      const key = this.#generateKey();
+      this.#accountToKey.set(account, key);
+      this.#keyToAccount.set(key, account);
+      log("info", `为账号 ${account} 生成新密钥`);
+    }
+    return this.#accountToKey.get(account);
+  }
+
+  validate(key) {
+    return this.#keyToAccount.has(key) || key === SECRET_KEY;
+  }
+
+  #generateKey() {
+    const bytes = crypto.randomBytes(24);
+    let key = "";
+    for (let i = 0; i < 24; i++) key += this.#charSet[bytes[i] % this.#charSet.length];
+    return key;
+  }
+}
 
 class Queue {
   #msgs = [];
@@ -202,11 +231,13 @@ class FormatConverter {
 class Handler {
   #server;
   #conns;
+  #keyManager;
   #converter = new FormatConverter();
 
-  constructor(server, conns) {
+  constructor(server, conns, keyManager) {
     this.#server = server;
     this.#conns = conns;
+    this.#keyManager = keyManager;
   }
 
   async handle(req, res, isOpenAI = false) {
@@ -248,7 +279,7 @@ class Handler {
   #auth = (req, res) => {
     // 允许预检请求通过认证，或检查 key
     if (req.method === 'OPTIONS') return true;
-    if ((req.query.key || req.headers.authorization?.substring(7)) === SECRET_KEY) return true;
+    if (this.#keyManager.validate(req.query.key || req.headers.authorization?.substring(7))) return true;
     this.#send(res, 401, "Unauthorized", true);
     return false;
   }
@@ -353,11 +384,12 @@ class Handler {
 
 class Server {
   #handler;
+  #keyManager = new KeyManager();
   mode = DEFAULT_STREAMING_MODE;
 
   constructor() {
     const conns = new Connections();
-    this.#handler = new Handler(this, conns);
+    this.#handler = new Handler(this, conns, this.#keyManager);
     this.start(conns);
   }
 
@@ -384,7 +416,19 @@ class Server {
 
     app.get("/", (req, res) => res.status(conns.hasConn() ? 200 : 404).send(conns.hasConn() ? "✅ 代理就绪" : "❌ 无连接"));
     app.get("/favicon.ico", (req, res) => res.status(204).send());
-    
+
+    app.get("/:account", (req, res, next) => {
+      const account = req.params.account;
+      if (!account.includes("@")) return next();
+      try {
+        const key = this.#keyManager.getOrCreate(account);
+        res.json({ account, key });
+      } catch (err) {
+        log("error", `生成密钥失败: ${err.message}`);
+        res.status(400).json({ error: err.message });
+      }
+    });
+
     app.get("/admin/set-mode", (req, res) => {
       if (["fake", "real"].includes(req.query.mode)) {
         this.mode = req.query.mode;
