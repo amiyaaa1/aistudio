@@ -11,22 +11,48 @@ const log = (...msgs) => {
   document.body.appendChild(div);
 };
 
+const detectAccount = () => {
+  const parseGState = () => {
+    try {
+      const raw = localStorage.getItem("g_state");
+      if (!raw) return null;
+      const state = JSON.parse(raw);
+      return state.login_hint || state.email || null;
+    } catch (err) {
+      log("读取 g_state 失败:", err.message);
+      return null;
+    }
+  };
+
+  const metaEmail = document.querySelector('meta[name="user-email"]')?.content;
+  const detected = parseGState() || metaEmail;
+  if (detected) return detected;
+
+  const manual = prompt("请输入当前使用的账号邮箱（如 example@gmail.com）以区分会话");
+  if (!manual) throw new Error("无法获取账号邮箱");
+  return manual.trim();
+};
+
 class Connection extends EventTarget {
   #ws = null;
   #reconnectTimer = null;
   #attempts = 0;
 
-  constructor(endpoint = WS_ENDPOINT) {
+  constructor(endpoint = WS_ENDPOINT, account) {
     super();
     this.endpoint = endpoint;
+    this.account = account;
     this.connected = false;
   }
 
   async connect() {
     if (this.connected) return;
-    log("连接中:", this.endpoint);
+    if (!this.account) throw new Error("缺少账号信息");
+    const url = new URL(this.endpoint);
+    url.searchParams.set("account", this.account);
+    log("连接中:", `${url} (${this.account})`);
     try {
-      this.#ws = new WebSocket(this.endpoint);
+      this.#ws = new WebSocket(url.toString());
       this.#bindEvents();
     } catch (err) {
       log("WS初始化失败:", err.message);
@@ -143,13 +169,14 @@ class Proxy {
   #conn;
   #proc = new Processor();
 
-  constructor(endpoint) {
-    this.#conn = new Connection(endpoint);
+  constructor(endpoint, account) {
+    this.account = account;
+    this.#conn = new Connection(endpoint, account);
     this.#setup();
   }
 
   async init() {
-    log("系统初始化...");
+    log("系统初始化...", `账号: ${this.account}`);
     await this.#conn.connect();
     log("系统就绪");
   }
@@ -272,7 +299,9 @@ class Proxy {
 async function main() {
   document.body.innerHTML = "";
   try {
-    const proxy = new Proxy();
+    const account = detectAccount();
+    log("检测到账户:", account);
+    const proxy = new Proxy(WS_ENDPOINT, account);
     await proxy.init();
   } catch (err) {
     log("启动失败:", err.message);
