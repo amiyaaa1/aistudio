@@ -2,11 +2,73 @@ const express = require("express");
 const WebSocket = require("ws");
 const http = require("http");
 
-const SECRET_KEY = process.env.MY_SECRET_KEY || "123456";
+const ADMIN_KEY = process.env.ADMIN_KEY || process.env.MY_SECRET_KEY || "123456";
 const DEFAULT_STREAMING_MODE = "real";
+const CLIENT_KEY_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-";
 
 const log = (level, msg) => console[level](`[${level.toUpperCase()}] ${new Date().toISOString()} - ${msg}`);
 const genId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+
+const generatedClientKeys = new Set();
+const generateClientKey = () => {
+  let key = "";
+  while (!key || generatedClientKeys.has(key)) {
+    key = Array.from({ length: 32 }, () => CLIENT_KEY_CHARS[Math.floor(Math.random() * CLIENT_KEY_CHARS.length)]).join("");
+  }
+  generatedClientKeys.add(key);
+  return key;
+};
+
+const renderBuildPage = (clientKey) => `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Studio Proxy 前端</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; }
+    .card { max-width: 840px; margin: 0 auto; background: #111827; border: 1px solid #1f2937; border-radius: 16px; padding: 24px; box-shadow: 0 20px 40px rgba(0,0,0,0.35); }
+    h1 { margin-top: 0; font-size: 26px; letter-spacing: 0.5px; }
+    code { background: #0b1220; padding: 4px 8px; border-radius: 6px; color: #7dd3fc; }
+    .keys { display: grid; gap: 12px; margin: 16px 0; }
+    .label { font-weight: 600; color: #94a3b8; }
+    .value { font-size: 16px; word-break: break-all; background: #0b1220; padding: 12px; border-radius: 10px; border: 1px solid #1f2937; }
+    .cta { background: linear-gradient(135deg,#22d3ee,#818cf8); color: #0b1220; border: none; padding: 12px 18px; border-radius: 10px; font-weight: 700; cursor: pointer; margin-top: 8px; }
+    pre { background: #0b1220; padding: 12px; border-radius: 10px; border: 1px solid #1f2937; overflow-x: auto; }
+    a { color: #38bdf8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>AI Studio Proxy 前端</h1>
+    <p>每次打开都会为你生成一个全新的调用密钥，用于区分个人凭证。以下信息仅供当前构建使用，请妥善保管。</p>
+    <div class="keys">
+      <div>
+        <div class="label">本次构建发放的调用密钥</div>
+        <div class="value" id="clientKey">${clientKey}</div>
+      </div>
+    </div>
+    <button class="cta" onclick="copyKey()">复制调用密钥</button>
+    <p>使用示例（OpenAI 兼容接口）：</p>
+    <pre><code id="sampleCurl">curl -X POST "<span id="endpoint">/v1/chat/completions</span>" \
+  -H "Content-Type: application/json" \
+  -H "X-Client-Key: ${clientKey}" \
+  -d '{"model":"gemini-pro","messages":[{"role":"user","content":"Hello"}]}'</code></pre>
+    <p>请求头中的 <code>X-Client-Key</code> 即为本次构建发放的密钥。后端会基于密钥区分用户身份。</p>
+  </div>
+  <script>
+    function copyKey() {
+      const key = document.getElementById('clientKey').textContent;
+      navigator.clipboard.writeText(key).then(() => alert('调用密钥已复制')).catch(() => alert('复制失败，请手动复制'));
+    }
+    (function updateEndpoint() {
+      var endpoint = document.getElementById('endpoint');
+      if (endpoint) endpoint.textContent = window.location.origin + '/v1/chat/completions';
+    })();
+  </script>
+</body>
+</html>`;
 
 class Queue {
   #msgs = [];
@@ -246,11 +308,14 @@ class Handler {
   }
 
   #auth = (req, res) => {
-    // 允许预检请求通过认证，或检查 key
+    // 允许预检请求通过认证，或检查 client key
     if (req.method === 'OPTIONS') return true;
-    if ((req.query.key || req.headers.authorization?.substring(7)) === SECRET_KEY) return true;
-    this.#send(res, 401, "Unauthorized", true);
-    return false;
+    const clientKey = req.headers["x-client-key"];
+    if (!clientKey || !generatedClientKeys.has(clientKey)) {
+      this.#send(res, 401, "无效或缺失的调用密钥", true);
+      return false;
+    }
+    return true;
   }
 
   #checkConn = (res, isOpenAI) => {
@@ -363,6 +428,11 @@ class Server {
 
   async start(conns) {
     const app = express();
+    const isAdmin = (req) => (req.query.admin_key || req.query.key || req.headers.authorization?.substring(7)) === ADMIN_KEY;
+    const requireAdmin = (req, res, next) => {
+      if (isAdmin(req)) return next();
+      res.status(401).send('Unauthorized');
+    };
 
     // --- 🔥🔥🔥 CORS 修复开始 🔥🔥🔥 ---
     // 手动添加跨域头，无需安装额外依赖
@@ -384,8 +454,13 @@ class Server {
 
     app.get("/", (req, res) => res.status(conns.hasConn() ? 200 : 404).send(conns.hasConn() ? "✅ 代理就绪" : "❌ 无连接"));
     app.get("/favicon.ico", (req, res) => res.status(204).send());
-    
-    app.get("/admin/set-mode", (req, res) => {
+
+    app.get(["/build", "/build/index.html"], requireAdmin, (req, res) => {
+      const clientKey = generateClientKey();
+      res.set("Content-Type", "text/html; charset=utf-8").send(renderBuildPage(clientKey));
+    });
+
+    app.get("/admin/set-mode", requireAdmin, (req, res) => {
       if (["fake", "real"].includes(req.query.mode)) {
         this.mode = req.query.mode;
         log("info", `模式切换: ${this.mode}`);
@@ -393,7 +468,7 @@ class Server {
       }
       res.status(400).send('无效模式');
     });
-    app.get("/admin/get-mode", (req, res) => res.send(`当前模式: ${this.mode}`));
+    app.get("/admin/get-mode", requireAdmin, (req, res) => res.send(`当前模式: ${this.mode}`));
     
     app.get("/v1/models", (req, res) => this.#handler.handleModels(req, res));
     app.post("/v1/chat/completions", (req, res) => this.#handler.handle(req, res, true));
