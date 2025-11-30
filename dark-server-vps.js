@@ -456,7 +456,10 @@ class Server {
     const httpServer = http.createServer(app);
     const wss = new WebSocket.Server({ server: httpServer });
     wss.on("connection", (ws, req) => {
-      const email = normalizeEmailPath(req.url);
+      const parsed = new URL(req.url, `ws://${req.headers.host}`);
+      const emailFromPath = normalizeEmailPath(parsed.pathname);
+      const emailParam = normalizeEmailPath(parsed.searchParams.get("account") || parsed.searchParams.get("email"));
+      const email = emailParam || emailFromPath;
       conns.add(ws, { address: req.socket.remoteAddress, email });
     });
 
