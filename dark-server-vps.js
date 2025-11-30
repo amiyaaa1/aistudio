@@ -133,6 +133,22 @@ class Connections {
   };
   hasAnyConn = () => Array.from(this.#conns.values()).some((entry) => entry.ws?.isAlive);
 
+  onlyConn() {
+    const alive = Array.from(this.#conns.entries()).filter(([, entry]) => entry.ws?.isAlive);
+    if (alive.length === 1) return alive[0][0];
+    return null;
+  }
+
+  retag(oldAccount, newAccount) {
+    if (!oldAccount || !newAccount || oldAccount === newAccount) return false;
+    const entry = this.#conns.get(oldAccount);
+    if (!entry?.ws?.isAlive || this.#conns.has(newAccount)) return false;
+    this.#conns.delete(oldAccount);
+    this.#conns.set(newAccount, entry);
+    log("warn", `连接账号重命名: ${oldAccount} -> ${newAccount}`);
+    return true;
+  }
+
   getConn(account) {
     const entry = this.#conns.get(account);
     if (entry?.ws?.isAlive) return entry.ws;
@@ -324,7 +340,8 @@ class Handler {
     if (req.method === 'OPTIONS') return true;
     const key = this.#extractKey(req);
     if (this.#keyManager.validate(key)) {
-      req.account = this.#keyManager.getAccountByKey(key);
+      const account = this.#keyManager.getAccountByKey(key);
+      if (account) req.account = normalizeAccount(account);
       return true;
     }
     this.#send(res, 401, "Unauthorized", true);
@@ -332,7 +349,11 @@ class Handler {
   }
 
   #checkConn = (req, res, isOpenAI) => {
-    const targetAccount = req.account || this.#conns.firstAccount();
+    let targetAccount = normalizeAccount(req.account) || this.#conns.firstAccount();
+    const singleAccount = this.#conns.onlyConn();
+    if (targetAccount && !this.#conns.hasConn(targetAccount) && singleAccount && singleAccount !== targetAccount) {
+      this.#conns.retag(singleAccount, targetAccount);
+    }
     if (!targetAccount) {
       this.#send(res, 503, "无可用连接", isOpenAI);
       return false;
