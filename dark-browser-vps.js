@@ -1,4 +1,4 @@
-const WS_ENDPOINT = "wss://wuchen.zeabur.app";
+const WS_ENDPOINT = "wss://zyraftcs.zeabur.app";
 
 const log = (...msgs) => {
   const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
