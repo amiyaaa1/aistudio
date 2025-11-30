@@ -1,4 +1,5 @@
 const WS_ENDPOINT = "wss://zyraftcs.zeabur.app";
+const ACCOUNT_EMAIL = "your-account@example.com"; // 每个浏览器实例应填写自己的账号邮箱
 
 const log = (...msgs) => {
   const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
@@ -11,6 +12,13 @@ const log = (...msgs) => {
   document.body.appendChild(div);
 };
 
+const buildEndpoint = (endpoint, account) => {
+  if (!account) return endpoint;
+  const url = new URL(endpoint);
+  url.searchParams.set("account", account);
+  return url.toString();
+};
+
 class Connection extends EventTarget {
   #ws = null;
   #reconnectTimer = null;
@@ -18,13 +26,15 @@ class Connection extends EventTarget {
 
   constructor(endpoint = WS_ENDPOINT) {
     super();
-    this.endpoint = endpoint;
+    const accountFromUrl = new URLSearchParams(location.search).get("account");
+    this.account = (accountFromUrl || ACCOUNT_EMAIL || "").trim().toLowerCase();
+    this.endpoint = buildEndpoint(endpoint, this.account);
     this.connected = false;
   }
 
   async connect() {
     if (this.connected) return;
-    log("连接中:", this.endpoint);
+    log("连接中:", this.endpoint, this.account ? `(账号: ${this.account})` : "(未指定账号)");
     try {
       this.#ws = new WebSocket(this.endpoint);
       this.#bindEvents();
