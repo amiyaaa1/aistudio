@@ -459,7 +459,16 @@ class Server {
       const parsed = new URL(req.url, `ws://${req.headers.host}`);
       const emailFromPath = normalizeEmailPath(parsed.pathname);
       const emailParam = normalizeEmailPath(parsed.searchParams.get("account") || parsed.searchParams.get("email"));
-      const email = emailParam || emailFromPath;
+      const keyParam = parsed.searchParams.get("key") || parsed.searchParams.get("token");
+      const emailFromKey = keyParam ? conns.getEmailByKey(keyParam) : null;
+      const email = emailFromKey || emailParam || emailFromPath;
+
+      if (!email) {
+        log("warn", `WebSocket 缺少账号信息，拒绝连接 (${req.socket.remoteAddress})`);
+        ws.close(4401, "Missing account email or proxy key");
+        return;
+      }
+
       conns.add(ws, { address: req.socket.remoteAddress, email });
     });
 
