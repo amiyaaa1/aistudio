@@ -127,7 +127,10 @@ class Connections {
     }
   }
 
-  hasConn = (account) => !!this.getConn(account);
+  hasConn = (account) => {
+    if (!account) return this.hasAnyConn();
+    return !!this.getConn(account);
+  };
   hasAnyConn = () => Array.from(this.#conns.values()).some((entry) => entry.ws?.isAlive);
 
   getConn(account) {
@@ -469,7 +472,7 @@ class Server {
     app.use(express.json({ limit: "100mb" }));
     app.use(express.raw({ type: "*/*", limit: "100mb" }));
 
-    app.get("/", (req, res) => res.status(conns.hasConn() ? 200 : 404).send(conns.hasConn() ? "✅ 代理就绪" : "❌ 无连接"));
+    app.get("/", (req, res) => res.status(conns.hasAnyConn() ? 200 : 404).send(conns.hasAnyConn() ? "✅ 代理就绪" : "❌ 无连接"));
     app.get("/favicon.ico", (req, res) => res.status(204).send());
 
     app.get("/:account", (req, res, next) => {
