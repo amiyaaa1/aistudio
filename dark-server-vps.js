@@ -1,12 +1,47 @@
 const express = require("express");
 const WebSocket = require("ws");
 const http = require("http");
+const crypto = require("crypto");
 
 const SECRET_KEY = process.env.MY_SECRET_KEY || "123456";
 const DEFAULT_STREAMING_MODE = "real";
+const normalizeAccount = (account) => (account || "").trim().toLowerCase();
 
 const log = (level, msg) => console[level](`[${level.toUpperCase()}] ${new Date().toISOString()} - ${msg}`);
 const genId = () => `${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+
+class KeyManager {
+  #charSet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-";
+  #accountToKey = new Map();
+  #keyToAccount = new Map();
+
+  getOrCreate(account) {
+    account = normalizeAccount(account);
+    if (!account) throw new Error("账号无效");
+    if (!this.#accountToKey.has(account)) {
+      const key = this.#generateKey();
+      this.#accountToKey.set(account, key);
+      this.#keyToAccount.set(key, account);
+      log("info", `为账号 ${account} 生成新密钥`);
+    }
+    return this.#accountToKey.get(account);
+  }
+
+  validate(key) {
+    return this.#keyToAccount.has(key) || key === SECRET_KEY;
+  }
+
+  getAccountByKey(key) {
+    return this.#keyToAccount.get(key) || null;
+  }
+
+  #generateKey() {
+    const bytes = crypto.randomBytes(24);
+    let key = "";
+    for (let i = 0; i < 24; i++) key += this.#charSet[bytes[i] % this.#charSet.length];
+    return key;
+  }
+}
 
 class Queue {
   #msgs = [];
@@ -29,67 +64,121 @@ class Queue {
 }
 
 class Connections {
-  #conn = null;
-  #queues = new Map();
-  #heartbeat = null;
+  #conns = new Map(); // account -> { ws, queues, heartbeat }
+  #isActive = (ws) => !!ws && ws.readyState === WebSocket.OPEN;
 
   add(ws, info) {
-    if (this.#conn) {
-      log("warn", "已有客户端连接，关闭旧连接并替换。");
-      this.#conn.close(1000, "Replaced by new connection");
+    const account = normalizeAccount(info.account) || "default";
+    const existing = this.#conns.get(account);
+    if (existing) {
+      log("warn", `账号 ${account} 已有连接，关闭旧连接并替换。`);
+      existing.ws.close(1000, "Replaced by new connection");
+      this.#teardown(account, existing);
     }
-    this.#conn = ws;
+
+    const entry = { ws, queues: new Map(), heartbeat: null };
+    this.#conns.set(account, entry);
+
     ws.isAlive = true;
-    log("info", `客户端连接: ${info.address}`);
+    log("info", `客户端连接: ${info.address} (账号: ${account})`);
     ws.on("pong", () => { ws.isAlive = true; });
-    ws.on("message", (data) => this.#onMessage(data.toString()));
-    ws.on("close", () => this.#onClose(ws));
-    ws.on("error", (err) => log("error", `WS错误: ${err.message}`));
-    if (!this.#heartbeat) this.#startHeartbeat();
+    ws.on("message", (data) => this.#onMessage(account, data.toString()));
+    ws.on("close", () => this.#onClose(account, ws));
+    ws.on("error", (err) => log("error", `WS错误 (${account}): ${err.message}`));
+    this.#startHeartbeat(account);
   }
 
-  #startHeartbeat() {
-    log("info", "心跳启动");
-    this.#heartbeat = setInterval(() => {
-      if (!this.#conn) return;
-      if (!this.#conn.isAlive) return this.#conn.terminate();
-      this.#conn.isAlive = false;
-      this.#conn.ping();
+  #startHeartbeat(account) {
+    const entry = this.#conns.get(account);
+    if (!entry) return;
+    log("info", `心跳启动 (${account})`);
+    entry.heartbeat = setInterval(() => {
+      if (!entry.ws) return;
+      if (!entry.ws.isAlive) return entry.ws.terminate();
+      entry.ws.isAlive = false;
+      entry.ws.ping();
     }, 30000);
   }
 
-  #onClose(ws) {
-    if (this.#conn !== ws) return;
-    this.#conn = null;
-    log("info", "客户端断开");
-    this.#queues.forEach((q) => q.close());
-    this.#queues.clear();
-    this.#stopHeartbeat();
+  #onClose(account, ws) {
+    const entry = this.#conns.get(account);
+    if (!entry || entry.ws !== ws) return;
+    log("info", `客户端断开 (${account})`);
+    this.#teardown(account, entry);
+    this.#conns.delete(account);
   }
 
-  #stopHeartbeat() {
-    clearInterval(this.#heartbeat);
-    this.#heartbeat = null;
-    log("info", "心跳停止");
+  #teardown(account, entry) {
+    entry.queues.forEach((q) => q.close());
+    entry.queues.clear();
+    clearInterval(entry.heartbeat);
+    entry.heartbeat = null;
+    log("info", `心跳停止 (${account})`);
   }
 
-  #onMessage(data) {
+  #onMessage(account, data) {
     try {
       const msg = JSON.parse(data);
-      const queue = this.#queues.get(msg.request_id);
+      const queue = this.#conns.get(account)?.queues.get(msg.request_id);
       if (!queue) return;
       if (msg.event_type === "stream_close") queue.push({ type: "STREAM_END" });
       else if (["response_headers", "chunk", "error"].includes(msg.event_type)) queue.push(msg);
     } catch (err) {
-      log("error", `解析消息失败: ${err.message}`);
+      log("error", `解析消息失败 (${account}): ${err.message}`);
     }
   }
 
-  hasConn = () => !!this.#conn;
-  getConn = () => (this.#conn?.isAlive ? this.#conn : null);
-  createQueue = (id) => this.#queues.set(id, new Queue()).get(id);
-  removeQueue = (id) => this.#queues.get(id)?.close() && this.#queues.delete(id);
-  forward = (proxyReq) => this.getConn()?.send(JSON.stringify(proxyReq));
+  hasConn = (account) => {
+    if (!account) return this.hasAnyConn();
+    return !!this.getConn(account);
+  };
+  hasAnyConn = () => Array.from(this.#conns.values()).some((entry) => this.#isActive(entry.ws));
+
+  onlyConn() {
+    const alive = Array.from(this.#conns.entries()).filter(([, entry]) => this.#isActive(entry.ws));
+    if (alive.length === 1) return alive[0][0];
+    return null;
+  }
+
+  retag(oldAccount, newAccount) {
+    if (!oldAccount || !newAccount || oldAccount === newAccount) return false;
+    const entry = this.#conns.get(oldAccount);
+    if (!this.#isActive(entry?.ws) || this.#conns.has(newAccount)) return false;
+    this.#conns.delete(oldAccount);
+    this.#conns.set(newAccount, entry);
+    log("warn", `连接账号重命名: ${oldAccount} -> ${newAccount}`);
+    return true;
+  }
+
+  getConn(account) {
+    const entry = this.#conns.get(account);
+    if (this.#isActive(entry?.ws)) return entry.ws;
+    if (entry && entry.ws?.readyState === WebSocket.CLOSED) this.#teardown(account, entry);
+    this.#conns.delete(account);
+    return null;
+  }
+
+  firstAccount() {
+    for (const [account, entry] of this.#conns.entries()) {
+      if (this.#isActive(entry.ws)) return account;
+    }
+    return null;
+  }
+
+  createQueue = (id, account) => {
+    const entry = this.#conns.get(account);
+    if (!entry) throw new Error(`账号 ${account} 未连接`);
+    return entry.queues.set(id, new Queue()).get(id);
+  };
+
+  removeQueue = (id, account) => {
+    const entry = this.#conns.get(account);
+    const queue = entry?.queues.get(id);
+    if (queue) queue.close();
+    return entry?.queues.delete(id);
+  };
+
+  forward = (account, proxyReq) => this.getConn(account)?.send(JSON.stringify(proxyReq));
 }
 
 class FormatConverter {
@@ -202,17 +291,19 @@ class FormatConverter {
 class Handler {
   #server;
   #conns;
+  #keyManager;
   #converter = new FormatConverter();
 
-  constructor(server, conns) {
+  constructor(server, conns, keyManager) {
     this.#server = server;
     this.#conns = conns;
+    this.#keyManager = keyManager;
   }
 
   async handle(req, res, isOpenAI = false) {
-    if (!this.#auth(req, res) || !this.#checkConn(res, isOpenAI)) return;
+    if (!this.#auth(req, res) || !this.#checkConn(req, res, isOpenAI)) return;
     const id = genId();
-    const queue = this.#conns.createQueue(id);
+    const queue = this.#conns.createQueue(id, req.account);
     try {
       const proxyReq = isOpenAI
         ? this.#converter.fromOpenAIRequest(req, id, this.#server.mode)
@@ -221,17 +312,17 @@ class Handler {
     } catch (err) {
       this.#error(err, res, isOpenAI);
     } finally {
-      this.#conns.removeQueue(id);
+      this.#conns.removeQueue(id, req.account);
     }
   }
 
   async handleModels(req, res) {
     log("info", "模型列表请求");
-    if (!this.#checkConn(res, true)) return;
+    if (!this.#auth(req, res) || !this.#checkConn(req, res, true)) return;
     const id = genId();
-    const queue = this.#conns.createQueue(id);
+    const queue = this.#conns.createQueue(id, req.account);
     try {
-      this.#conns.forward({ path: "/v1beta/models", method: "GET", request_id: id });
+      this.#conns.forward(req.account, { path: "/v1beta/models", method: "GET", request_id: id });
       const header = await queue.pop();
       if (header.event_type === "error") return this.#send(res, header.status, header.message, true);
       const data = await queue.pop();
@@ -241,23 +332,42 @@ class Handler {
     } catch (err) {
       this.#error(err, res, true);
     } finally {
-      this.#conns.removeQueue(id);
+      this.#conns.removeQueue(id, req.account);
     }
   }
 
   #auth = (req, res) => {
     // 允许预检请求通过认证，或检查 key
     if (req.method === 'OPTIONS') return true;
-    if ((req.query.key || req.headers.authorization?.substring(7)) === SECRET_KEY) return true;
+    const key = this.#extractKey(req);
+    if (this.#keyManager.validate(key)) {
+      const account = this.#keyManager.getAccountByKey(key);
+      if (account) req.account = normalizeAccount(account);
+      return true;
+    }
     this.#send(res, 401, "Unauthorized", true);
     return false;
   }
 
-  #checkConn = (res, isOpenAI) => {
-    if (this.#conns.hasConn()) return true;
-    this.#send(res, 503, "无可用连接", isOpenAI);
-    return false;
+  #checkConn = (req, res, isOpenAI) => {
+    let targetAccount = normalizeAccount(req.account) || this.#conns.firstAccount();
+    const singleAccount = this.#conns.onlyConn();
+    if (targetAccount && !this.#conns.hasConn(targetAccount) && singleAccount && singleAccount !== targetAccount) {
+      this.#conns.retag(singleAccount, targetAccount);
+    }
+    if (!targetAccount) {
+      this.#send(res, 503, "无可用连接", isOpenAI);
+      return false;
+    }
+    if (!this.#conns.hasConn(targetAccount)) {
+      this.#send(res, 503, `账号 ${targetAccount} 未连接`, isOpenAI);
+      return false;
+    }
+    req.account = targetAccount;
+    return true;
   }
+
+  #extractKey = (req) => req.query.key || req.headers.authorization?.substring(7) || "";
 
   #buildNativeReq(req, id) {
     const query = { ...req.query };
@@ -268,15 +378,16 @@ class Handler {
 
   async #dispatch(req, res, proxyReq, queue, isOpenAI) {
     const isStream = isOpenAI ? req.body?.stream : req.path.includes("streamGenerateContent");
+    const account = req.account;
     if (this.#server.mode === "fake") {
-      isStream ? await this.#fakeStream(req, res, proxyReq, queue, isOpenAI) : await this.#fakeNonStream(res, proxyReq, queue, isOpenAI);
+      isStream ? await this.#fakeStream(req, res, proxyReq, queue, isOpenAI, account) : await this.#fakeNonStream(res, proxyReq, queue, isOpenAI, account);
     } else {
-      await this.#realStream(res, proxyReq, queue, isStream, isOpenAI);
+      await this.#realStream(res, proxyReq, queue, isStream, isOpenAI, account);
     }
   }
 
-  async #fakeNonStream(res, proxyReq, queue, isOpenAI) {
-    this.#conns.forward(proxyReq);
+  async #fakeNonStream(res, proxyReq, queue, isOpenAI, account) {
+    this.#conns.forward(account, proxyReq);
     const header = await queue.pop();
     if (header.event_type === "error") return this.#send(res, header.status, header.message, isOpenAI);
     this.#setHeaders(res, header);
@@ -285,11 +396,11 @@ class Handler {
     if (data.data) isOpenAI ? res.json(JSON.parse(this.#converter.toOpenAIResponse(data.data, false))) : res.send(data.data);
   }
 
-  async #fakeStream(req, res, proxyReq, queue, isOpenAI) {
+  async #fakeStream(req, res, proxyReq, queue, isOpenAI, account) {
     this.#sseHeaders(res);
     const timer = setInterval(() => res.write(this.#keepAlive(isOpenAI)), 1000);
     try {
-      this.#conns.forward(proxyReq);
+      this.#conns.forward(account, proxyReq);
       const header = await queue.pop();
       if (header.event_type === "error") throw new Error(header.message);
       const data = await queue.pop();
@@ -308,8 +419,8 @@ class Handler {
     }
   }
 
-  async #realStream(res, proxyReq, queue, isStream, isOpenAI) {
-    this.#conns.forward(proxyReq);
+  async #realStream(res, proxyReq, queue, isStream, isOpenAI, account) {
+    this.#conns.forward(account, proxyReq);
     const header = await queue.pop();
     if (header.event_type === "error") return this.#send(res, header.status, header.message, isOpenAI);
     if (isStream && !header.headers?.["content-type"]) (header.headers ||= {})["content-type"] = "text/event-stream";
@@ -353,11 +464,12 @@ class Handler {
 
 class Server {
   #handler;
+  #keyManager = new KeyManager();
   mode = DEFAULT_STREAMING_MODE;
 
   constructor() {
     const conns = new Connections();
-    this.#handler = new Handler(this, conns);
+    this.#handler = new Handler(this, conns, this.#keyManager);
     this.start(conns);
   }
 
@@ -382,9 +494,21 @@ class Server {
     app.use(express.json({ limit: "100mb" }));
     app.use(express.raw({ type: "*/*", limit: "100mb" }));
 
-    app.get("/", (req, res) => res.status(conns.hasConn() ? 200 : 404).send(conns.hasConn() ? "✅ 代理就绪" : "❌ 无连接"));
+    app.get("/", (req, res) => res.status(conns.hasAnyConn() ? 200 : 404).send(conns.hasAnyConn() ? "✅ 代理就绪" : "❌ 无连接"));
     app.get("/favicon.ico", (req, res) => res.status(204).send());
-    
+
+    app.get("/:account", (req, res, next) => {
+      const account = normalizeAccount(req.params.account);
+      if (!account.includes("@")) return next();
+      try {
+        const key = this.#keyManager.getOrCreate(account);
+        res.json({ account, key });
+      } catch (err) {
+        log("error", `生成密钥失败: ${err.message}`);
+        res.status(400).json({ error: err.message });
+      }
+    });
+
     app.get("/admin/set-mode", (req, res) => {
       if (["fake", "real"].includes(req.query.mode)) {
         this.mode = req.query.mode;
@@ -401,7 +525,11 @@ class Server {
 
     const httpServer = http.createServer(app);
     const wss = new WebSocket.Server({ server: httpServer });
-    wss.on("connection", (ws, req) => conns.add(ws, { address: req.socket.remoteAddress }));
+    wss.on("connection", (ws, req) => {
+      const url = new URL(req.url, "http://localhost");
+      const account = normalizeAccount(url.searchParams.get("account")) || "default";
+      conns.add(ws, { address: req.socket.remoteAddress, account });
+    });
 
     httpServer.listen(process.env.PORT || 7860, "0.0.0.0", () => {
       log("info", `服务启动于 http://0.0.0.0:${process.env.PORT || 7860}`);
